@@ -4,7 +4,7 @@ ResearchSwarm is a lightweight orchestration substrate for multi-agent research 
 
 Instead of treating a conversation as the primary unit of state, ResearchSwarm coordinates
 framework-agnostic agents through structured tasks, dependencies, artifacts, events, and durable
-run state. Phase 1 is intentionally a small execution runtime—not another full agent framework.
+run state. Phase 2 adds explicit, persistent research semantics above the small execution runtime.
 
 ## Why ResearchSwarm?
 
@@ -186,6 +186,83 @@ Core events include run creation/start/completion/failure, task creation/readine
 failure/blocking/cancellation, artifact creation, and recovery. Listener failures are logged without
 breaking execution.
 
+## Research semantics (Phase 2)
+
+**TaskGraph = what should execute and in what order.**
+
+**ResearchGraph = what the swarm currently believes, has tested, and has evidence for or against.**
+
+These are separate graphs. Execution dependencies form a DAG; research relationships can contain
+cycles. An experiment is a research record that can reference multiple runtime task IDs. Adding an
+experiment does not schedule tasks, execute work, or change any hypothesis's status or confidence.
+
+The research layer provides `Hypothesis`, `Claim`, `Evidence`, `Experiment`, `ExperimentResult`,
+`Critique`, and `Conflict` dataclasses, with explicit status/severity enums. `ResearchEdge` connects
+records using `ResearchRelation` values such as `TESTS`, `SUPPORTS`, `CONTRADICTS`, and `CRITIQUES`.
+Custom nonempty relation strings are also supported. Evidence and results can reference existing
+durable artifacts, and all records support JSON-compatible metadata.
+
+```python
+from researchswarm import (
+    Experiment, Hypothesis, MemoryStorage, ResearchRelation, ResearchWorkspace, Run,
+)
+
+async def research_example():
+    storage = MemoryStorage()
+    run = Run("Study X and Y")
+    await storage.save_run(run)  # A workspace belongs to an existing run.
+    workspace = ResearchWorkspace(run.id, storage)
+    h = await workspace.add_hypothesis(Hypothesis(
+        statement="Feature X predicts target Y",
+        rationale="A proposed shared mechanism.",
+    ))
+    e = await workspace.add_experiment(Experiment(
+        name="Test X against Y",
+        hypothesis_ids=(h.id,),
+        design={"sample_size": 100},
+    ))
+    await workspace.link(e.id, h.id, ResearchRelation.TESTS)
+    graph = await workspace.graph()
+    assert graph.experiments_for(h.id) == [e]
+```
+
+Inside an agent, use `workspace = ResearchWorkspace.from_context(context)`. The context stays
+unchanged and ordinary agents continue using only the generic runtime API. Context workspaces emit
+research events through the runtime's existing ordered, persisted event stream, associated with the
+current task. Standalone workspaces may receive an async `emit(event_type, payload)` callback; with
+no emitter they persist research state without events. Payloads contain IDs, types, and statuses,
+not large record contents. Persistence precedes emission; the two writes are not one transaction,
+and an emitter failure does not undo the research write.
+
+Use `workspace.update(entity)` for explicit changes and `workspace.resolve_conflict(conflict_id)`
+for explicit resolution. These emit update/resolution events when an emitter is present. There is
+no automatic confidence scoring, conflict detection, hypothesis promotion, or experiment selection.
+
+Graph reads return detached snapshots in creation-time/ID order. `incoming` and `outgoing` return
+edges; `parents`, `children`, and `related` return direct neighboring entities, deduplicated across
+relations. `evidence_for` and `evidence_against` select direct incoming evidence edges; support is
+not inferred transitively. `claims_for` selects supporting or contradicting claims. Experiment and
+critique queries include declared `hypothesis_ids`/`target_id` references as well as explicit edges;
+conflict queries match either side. Declared references never create implicit edges. Filter with
+`graph.entities(Hypothesis)` or use workspace `hypotheses()`, `claims()`, and `experiments()` helpers.
+
+Both built-in backends implement the optional `ResearchStorageProtocol`; the executor still requires
+only `StorageProtocol`. Writes validate research, task, and artifact references within the same run.
+Referenced records must already be persisted. In particular, an artifact returned from an agent in
+`AgentResult` is persisted **after** that agent returns; to reference it during the agent's execution,
+persist it first using `context.storage.save_artifact(context.run_id, artifact)`.
+Graph/workspace additions reject duplicate IDs, and missing research IDs raise `KeyError`.
+Storage `save_research_entity`/`save_research_edge` methods upsert by default; `create_only=True`
+rejects duplicates atomically. Entity types cannot change during updates. Writes use last-writer-wins
+semantics; workspace graph reads are detached views, not multi-call transactional snapshots.
+
+SQLite adds indexed `research_entities` and `research_edges` tables with JSON payloads and run-scoped
+foreign keys. Existing Phase 1 databases remain loadable. No runtime dependencies were added.
+
+See [`examples/research_graph.py`](examples/research_graph.py) for a deterministic example that
+persists entities, artifacts, edges, and events, reopens SQLite, and prints a research summary next
+to the separate execution plan.
+
 ## Architecture
 
 ```text
@@ -216,15 +293,12 @@ event listeners. The executor depends only on these abstractions and generic tas
 
 Run any example from the repository root after installing the package.
 
-## Phase 1 non-goals and roadmap
+## Non-goals and roadmap
 
-Phase 1 deliberately does not implement hypothesis or claims/evidence representations, experiment
-management, debate or consensus, deduplication, information-gain or budget-aware scheduling, model
-routing, provider wrappers, prompt templates, LLM memory, retrieval/RAG, vector databases,
-SwarmBench, evaluation metrics, or adaptive/learned orchestration.
-
-Those research semantics belong above this runtime. Future phases can build them on the stable
-relationship:
+Phase 2 provides structured epistemic state, not an automated scientist. Semantic deduplication,
+automatic conflict detection, confidence updates, experiment selection, research scheduling,
+embeddings, LLM calls, provider wrappers, and SwarmBench evaluation remain outside this phase.
+Dynamic research orchestration and evaluation can build on the relationship:
 
 ```text
 Research semantics -> ResearchSwarm runtime -> Structured event trace -> SwarmBench

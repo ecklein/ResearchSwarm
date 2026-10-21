@@ -28,10 +28,50 @@ from researchswarm.models import (
     Task,
     TaskStatus,
 )
+from researchswarm.research import (
+    Claim,
+    ClaimStatus,
+    Conflict,
+    ConflictStatus,
+    Critique,
+    CritiqueSeverity,
+    Evidence,
+    Experiment,
+    ExperimentResult,
+    ExperimentStatus,
+    Hypothesis,
+    HypothesisStatus,
+    ResearchEdge,
+    ResearchGraph,
+    ResearchRelation,
+    ResearchWorkspace,
+)
 from researchswarm.runtime import PriorityScheduler, RunContext, SchedulerProtocol, SwarmExecutor
-from researchswarm.storage import MemoryStorage, SQLiteStorage, StorageProtocol
+from researchswarm.storage import (
+    MemoryStorage,
+    ResearchStorageProtocol,
+    SQLiteStorage,
+    StorageProtocol,
+)
 
 __all__ = [
+    "Hypothesis",
+    "HypothesisStatus",
+    "Claim",
+    "ClaimStatus",
+    "Evidence",
+    "Experiment",
+    "ExperimentStatus",
+    "ExperimentResult",
+    "Critique",
+    "CritiqueSeverity",
+    "Conflict",
+    "ConflictStatus",
+    "ResearchEdge",
+    "ResearchRelation",
+    "ResearchGraph",
+    "ResearchWorkspace",
+    "ResearchStorageProtocol",
     "AgentNotFoundError",
     "AgentProtocol",
     "AgentResult",
@@ -64,4 +104,3 @@ __all__ = [
     "TaskNotFoundError",
     "TaskStatus",
 ]
-

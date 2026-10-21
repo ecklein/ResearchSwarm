@@ -16,6 +16,16 @@ from researchswarm.exceptions import (
     TaskNotFoundError,
 )
 from researchswarm.models import Artifact, Event, Run, Task
+from researchswarm.research.edges import ResearchEdge
+from researchswarm.research.models import ResearchEntity
+from researchswarm.research.models import entity_type as research_entity_type
+from researchswarm.research.persistence import runtime_references, validate_save
+from researchswarm.research.serialization import (
+    edge_from_dict,
+    edge_to_dict,
+    entity_from_dict,
+    entity_to_dict,
+)
 from researchswarm.serialization import (
     artifact_from_dict,
     ensure_json,
@@ -79,6 +89,30 @@ CREATE TABLE IF NOT EXISTS events (
     sequence_number INTEGER NOT NULL,
     UNIQUE (run_id, sequence_number)
 );
+CREATE TABLE IF NOT EXISTS research_entities (
+    id TEXT NOT NULL,
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    entity_type TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    PRIMARY KEY (run_id, id)
+);
+CREATE TABLE IF NOT EXISTS research_edges (
+    id TEXT NOT NULL,
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    source_id TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    relation TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    metadata_json TEXT NOT NULL,
+    PRIMARY KEY (run_id, id),
+    FOREIGN KEY (run_id, source_id) REFERENCES research_entities(run_id, id),
+    FOREIGN KEY (run_id, target_id) REFERENCES research_entities(run_id, id)
+);
+CREATE INDEX IF NOT EXISTS idx_research_entity_type ON research_entities(run_id, entity_type);
+CREATE INDEX IF NOT EXISTS idx_research_edge_source ON research_edges(run_id, source_id);
+CREATE INDEX IF NOT EXISTS idx_research_edge_target ON research_edges(run_id, target_id);
+CREATE INDEX IF NOT EXISTS idx_research_edge_relation ON research_edges(run_id, relation);
 CREATE INDEX IF NOT EXISTS idx_tasks_run_status ON tasks(run_id, status);
 CREATE INDEX IF NOT EXISTS idx_artifacts_run ON artifacts(run_id);
 CREATE INDEX IF NOT EXISTS idx_events_run_sequence ON events(run_id, sequence_number);
@@ -234,6 +268,150 @@ class SQLiteStorage:
                 "SELECT * FROM events WHERE run_id = ? ORDER BY sequence_number", (run_id,)
             )
             return [event_from_dict(_event_data(row)) for row in rows]
+
+    def _research_entities(self, run_id: str) -> list[ResearchEntity]:
+        rows = self._fetchall(
+            "SELECT payload_json FROM research_entities WHERE run_id = ? ORDER BY created_at, id",
+            (run_id,),
+        )
+        entities = [entity_from_dict(json.loads(row["payload_json"])) for row in rows]
+        # ISO text ordering differs from chronological ordering across UTC offsets.
+        return sorted(entities, key=lambda item: (item.created_at, item.id))
+
+    async def save_research_entity(
+        self, run_id: str, entity: ResearchEntity, *, create_only: bool = False
+    ) -> None:
+        copied = entity_from_dict(entity_to_dict(entity))
+        async with self._lock:
+            # Lock across validation and write, including other SQLite connections.
+            # The connection context rolls back on any validation/write failure.
+            with self._connection:
+                self._execute("BEGIN IMMEDIATE", ())
+                self._require_run(run_id)
+                validate_save(self._research_entities(run_id), copied, create_only=create_only)
+                for kind, ref in runtime_references(copied):
+                    if kind == "task":
+                        if (
+                            self._fetchone(
+                                "SELECT id FROM tasks WHERE run_id = ? AND id = ?", (run_id, ref)
+                            )
+                            is None
+                        ):
+                            raise TaskNotFoundError(f"task not found: {ref}")
+                    elif (
+                        self._fetchone(
+                            "SELECT id FROM artifacts WHERE run_id = ? AND id = ?", (run_id, ref)
+                        )
+                        is None
+                    ):
+                        raise ArtifactNotFoundError(f"artifact not found: {ref}")
+                self._execute(
+                    """INSERT INTO research_entities VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(run_id, id) DO UPDATE SET
+                    created_at=excluded.created_at, payload_json=excluded.payload_json""",
+                    (
+                        copied.id,
+                        run_id,
+                        research_entity_type(copied),
+                        copied.created_at.isoformat(),
+                        _json(entity_to_dict(copied)),
+                    ),
+                )
+
+    async def get_research_entity(self, run_id: str, entity_id: str) -> ResearchEntity:
+        async with self._lock:
+            self._require_run(run_id)
+            row = self._fetchone(
+                "SELECT payload_json FROM research_entities WHERE run_id = ? AND id = ?",
+                (run_id, entity_id),
+            )
+            if row is None:
+                raise KeyError(entity_id)
+            return entity_from_dict(json.loads(row["payload_json"]))
+
+    async def list_research_entities(
+        self, run_id: str, entity_type: type[ResearchEntity] | None = None
+    ) -> list[ResearchEntity]:
+        async with self._lock:
+            self._require_run(run_id)
+            return [
+                item
+                for item in self._research_entities(run_id)
+                if entity_type is None or isinstance(item, entity_type)
+            ]
+
+    async def save_research_edge(
+        self, run_id: str, edge: ResearchEdge, *, create_only: bool = False
+    ) -> None:
+        copied = edge_from_dict(edge_to_dict(edge))
+        async with self._lock:
+            with self._connection:
+                self._execute("BEGIN IMMEDIATE", ())
+                self._require_run(run_id)
+                if (
+                    create_only
+                    and self._fetchone(
+                        "SELECT id FROM research_edges WHERE run_id = ? AND id = ?",
+                        (run_id, copied.id),
+                    )
+                    is not None
+                ):
+                    raise ValueError(f"duplicate research edge: {copied.id}")
+                for ref in (copied.source_id, copied.target_id):
+                    if (
+                        self._fetchone(
+                            "SELECT id FROM research_entities WHERE run_id = ? AND id = ?",
+                            (run_id, ref),
+                        )
+                        is None
+                    ):
+                        raise KeyError(ref)
+                self._execute(
+                    """INSERT INTO research_edges VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(run_id, id) DO UPDATE SET source_id=excluded.source_id,
+                    target_id=excluded.target_id, relation=excluded.relation,
+                    created_at=excluded.created_at, metadata_json=excluded.metadata_json""",
+                    (
+                        copied.id,
+                        run_id,
+                        copied.source_id,
+                        copied.target_id,
+                        str(copied.relation),
+                        copied.created_at.isoformat(),
+                        _json(copied.metadata),
+                    ),
+                )
+
+    async def list_research_edges(self, run_id: str) -> list[ResearchEdge]:
+        async with self._lock:
+            self._require_run(run_id)
+            rows = self._fetchall(
+                "SELECT * FROM research_edges WHERE run_id = ? ORDER BY created_at, id", (run_id,)
+            )
+            edges = [
+                edge_from_dict(
+                    {
+                        "id": row["id"],
+                        "source_id": row["source_id"],
+                        "target_id": row["target_id"],
+                        "relation": row["relation"],
+                        "created_at": row["created_at"],
+                        "metadata": json.loads(row["metadata_json"]),
+                    }
+                )
+                for row in rows
+            ]
+            return sorted(edges, key=lambda item: (item.created_at, item.id))
+
+    async def delete_research_edge(self, run_id: str, edge_id: str) -> None:
+        async with self._lock:
+            with self._connection:
+                self._require_run(run_id)
+                cursor = self._execute(
+                    "DELETE FROM research_edges WHERE run_id = ? AND id = ?", (run_id, edge_id)
+                )
+                if cursor.rowcount == 0:
+                    raise KeyError(edge_id)
 
     async def close(self) -> None:
         async with self._lock:
