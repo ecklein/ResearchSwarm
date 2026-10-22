@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from researchswarm.exceptions import InvalidStateTransitionError
@@ -12,6 +13,8 @@ from researchswarm.utils import ensure_aware, generate_id, utc_now
 
 if TYPE_CHECKING:
     from researchswarm.storage.base import StorageProtocol
+    from researchswarm.trace.models import TraceExportOptions
+    from researchswarm.trace.trace import RunTrace
 
 
 class RunStatus(StrEnum):
@@ -91,3 +94,25 @@ class SwarmResult:
     async def events(self):  # type: ignore[no-untyped-def]
         """Return the ordered event trace for the run."""
         return await self._storage.list_events(self.run_id)
+
+
+    async def trace(self, options: TraceExportOptions | None = None) -> RunTrace:
+        """Export a portable snapshot through the backend-independent storage contract."""
+        from researchswarm.trace.trace import RunTrace
+
+        return await RunTrace.from_storage(self.run_id, self._storage, options)
+
+    async def export_trace(
+        self,
+        path: str | Path,
+        options: TraceExportOptions | None = None,
+        *,
+        directory: bool = False,
+    ) -> RunTrace:
+        """Write a trace and return it for further inspection."""
+        trace = await self.trace(options)
+        if directory:
+            trace.to_directory(path)
+        else:
+            trace.to_json(path)
+        return trace

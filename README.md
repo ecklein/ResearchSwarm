@@ -389,6 +389,92 @@ at startup and after each batch; a budget-triggered stop emits `budget.exhausted
 Run [`examples/information_value_scheduler.py`](examples/information_value_scheduler.py) to see
 scores, estimated and actual costs, remaining budget, and a two-slot selection trace without API keys.
 
+## Portable traces and replay (Phase 4)
+
+- **Storage** is live durable state used to run ResearchSwarm.
+- **RunTrace** is a portable representation of what happened.
+- **Replay** deterministically reconstructs recorded event state without invoking agents.
+- **SwarmBench** is a future package that will evaluate and compare traces.
+
+```python
+from researchswarm import RunTrace, TraceValidator, ReplayEngine, verify_replay
+
+# Inside an async function, after running a swarm:
+trace = await result.trace()
+trace.to_json("run.json")
+# Or: await result.export_trace("run.json")
+
+loaded = RunTrace.load("run.json")  # No database, original agents, or providers needed.
+validation = TraceValidator.validate(loaded)
+validation.raise_for_errors()
+state = ReplayEngine.replay(loaded)
+assert state.run_status == result.status
+verify_replay(loaded).raise_for_errors()
+print(loaded.manifest())
+```
+
+The public schema is `researchswarm.trace.v1`; unsupported versions raise
+`UnsupportedTraceVersionError`. Explicit task, artifact and research entity records preserve IDs,
+relationships, timestamps, metadata, outcomes and reported resource usage. Events are ordered by
+sequence number. Exports also support `CREATED` and `RUNNING` runs without requiring a completion event:
+
+```python
+trace = await RunTrace.from_storage(run_id, storage)
+trace.to_directory("exported-run")  # New directory: trace.json, events.jsonl, manifest.json, artifacts/
+```
+
+Artifact data is excluded by default. Control task content separately:
+
+```python
+from researchswarm import TraceExportOptions
+
+trace = await result.trace(TraceExportOptions(
+    include_task_inputs=False,
+    include_task_outputs=False,
+    include_artifact_data=False,
+))
+```
+
+These flags exclude the named fields, not arbitrary metadata or event payloads. Traces may contain
+prompts, model responses, datasets, or proprietary research. Review them before sharing. URIs are
+preserved without fetching external data. Optional artifact exports copy JSON, not binary storage.
+
+Replay derives run/task states, execution order, artifact creation, reported usage, budget snapshots,
+stop reasons, and research-event summaries. Full research contents come from the exported snapshot:
+ID-only events cannot reconstruct statements or designs. Unknown custom events are retained.
+`verify_replay` returns useful diagnostics when stored snapshots differ from recorded event state;
+it never fills event gaps from final state to make verification pass. Direct artifact storage writes
+without creation events produce warnings.
+
+API export uses the existing storage protocol, which has no cross-record snapshot transaction.
+Export a quiescent run when possible. A partial export or a crash between saving state and appending
+an event may yield a verification mismatch; the stored data remains inspectable.
+
+`trace.manifest()` gives version, run identity/objective/status, counts, timing, total usage and a
+trace fingerprint. `fingerprint_json(...)` and `trace.fingerprints()` provide deterministic SHA-256
+comparison hashes; these are not authenticated or tamper-proof provenance. Export timestamps are
+excluded from the trace body hash. Factual helpers include `task_dependencies()`, `execution_order()`,
+`tasks_by_agent()`, `research_entities_by_type()`, `total_usage()`, `duration()`, `failed_tasks()`, and
+`compare_traces(a, b)`. No quality scores or rankings are calculated.
+
+After installing the package, the standard-library CLI supports:
+
+```bash
+researchswarm trace export --db researchswarm.db --run-id run_123 --output trace.json
+researchswarm trace validate trace.json
+researchswarm trace replay trace.json
+```
+
+`python -m researchswarm` offers the same commands from a checkout. Export flags include `--directory`,
+`--include-artifact-data`, `--exclude-task-inputs`, and `--exclude-task-outputs`. CLI exports read a
+consistent SQLite backup without modifying the source database. Validation/replay return exit code
+0 for success, 1 for reported validation/verification failures, and 2 for loading/command errors.
+
+See the [v1 interchange contract](docs/trace-format-v1.md) for the JSON field definitions and replay
+semantics, and [trace_and_replay.py](examples/trace_and_replay.py) for a deterministic example. An
+external library can analyze the JSON with a standard JSON parser; it does not need runtime objects
+or the original database. This is the ResearchSwarm-to-SwarmBench boundary, not SwarmBench itself.
+
 ## Architecture
 
 ```text
@@ -416,12 +502,13 @@ event listeners. The executor depends only on these abstractions and generic tas
 - [`examples/dependency_graph.py`](examples/dependency_graph.py): a sequential pipeline consuming dependency outputs.
 - [`examples/dynamic_expansion.py`](examples/dynamic_expansion.py): an agent expands the active DAG.
 - [`examples/custom_agent.py`](examples/custom_agent.py): a minimal deterministic custom agent.
+- [`examples/trace_and_replay.py`](examples/trace_and_replay.py): export, reload, validate, and replay a research run.
 
 Run any example from the repository root after installing the package.
 
 ## Non-goals and roadmap
 
-Phase 3 provides algorithmic scheduling over explicit numeric signals. Semantic deduplication,
+Phase 4 adds a portable trace and replay boundary to Phase 3 scheduling. Semantic deduplication,
 automatic conflict detection, confidence updates, automatic experiment design, embeddings, LLM
 supervisors, bandits, reinforcement learning, and SwarmBench evaluation remain future work.
 Those policies and evaluation tools can build on the relationship:
