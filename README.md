@@ -4,7 +4,8 @@ ResearchSwarm is a lightweight orchestration substrate for multi-agent research 
 
 Instead of treating a conversation as the primary unit of state, ResearchSwarm coordinates
 framework-agnostic agents through structured tasks, dependencies, artifacts, events, and durable
-run state. Phase 2 adds explicit, persistent research semantics above the small execution runtime.
+run state. Phase 2 adds persistent research semantics; Phase 3 adds explicit value estimates,
+budget-aware scheduling, and stopping decisions above the small execution runtime.
 
 ## Why ResearchSwarm?
 
@@ -263,6 +264,131 @@ See [`examples/research_graph.py`](examples/research_graph.py) for a determinist
 persists entities, artifacts, edges, and events, reopens SQLite, and prints a research summary next
 to the separate execution plan.
 
+## Dynamic scheduling and budgets (Phase 3)
+
+`PriorityScheduler`: **Which task was assigned the largest static priority?**
+
+`InformationValueScheduler`: **Which ready task currently provides the most expected research
+value per unit cost?**
+
+ResearchSwarm does not infer these values. Agents or domain logic supply explicit numeric
+`SchedulingSignals`; future policies can use the same interfaces. Scheduling never reads natural
+language hypotheses, calls an LLM manager, or changes research confidence. `TaskGraph` still controls
+readiness, and `ResearchGraph` still stores epistemic state.
+
+```python
+from researchswarm import (
+    AgentResult, BudgetLimits, InformationValueScheduler, ResourceUsage,
+    SchedulingSignals, Swarm, Task, set_scheduling_signals,
+)
+
+class MeasurementAgent:
+    async def run(self, task, context):
+        return AgentResult(
+            output={"measurement": 0.42},
+            usage=ResourceUsage(cost=0.12, input_tokens=100, output_tokens=40),
+        )
+
+swarm = Swarm(
+    "Choose useful measurements",
+    scheduler=InformationValueScheduler(),
+    budget=BudgetLimits(max_cost=0.5, max_tasks=3),
+    max_concurrency=2,
+)
+swarm.register_agent("measure", MeasurementAgent())
+task = Task("Study X", "Measure X against Y", agent_type="measure")
+set_scheduling_signals(task, SchedulingSignals(
+    expected_information_gain=0.9, uncertainty=0.8, novelty=0.9,
+    dependency_value=0.7, estimated_cost=0.2,
+))
+swarm.add_task(task)
+# In an async function: result = await swarm.run()
+```
+
+Signals are stored in `task.metadata["researchswarm"]["scheduling"]`; the helpers preserve unrelated
+metadata and validate JSON serialization. An optional `hypothesis_id=` argument on
+`set_scheduling_signals` stores an explicit association alongside the estimates. It does not create
+research edges or infer uncertainty. `get_scheduling_signals(task)` returns `None` for absent signals;
+malformed explicit signal data raises a validation error.
+
+The exact information-value formula is:
+
+```text
+score = (expected_information_gain * uncertainty * novelty * dependency_value)
+        / max(estimated_cost, epsilon) ** alpha
+```
+
+Defaults are `alpha=1.0` and `epsilon=1e-9`. Ranking is descending score, descending task priority,
+ascending creation time, then ascending task ID. With `fallback_to_priority=True` (the default),
+a task without signals uses its static priority as its score, including in mixed queues. With
+`False`, it uses default signals (all value factors 0.5, cost 1). Zero-cost estimates are safe.
+
+Passing `budget=BudgetLimits(...)` to `Swarm` automatically applies `BudgetAwareScheduler` around the
+chosen policy and enables budget-exhausted/no-affordable-work stop conditions. The wrapper walks the
+policy's ranking and reserves **combined** estimated cost, tokens, and task slots across each batch.
+It skips an unaffordable candidate and considers cheaper ones. Selected concurrent tasks must each
+fit the remaining time estimate; their durations are not summed. Skipping leaves tasks ready.
+`BudgetAwareScheduler(policy, ledger)` is also usable independently; standalone callers update that
+ledger themselves. With `Swarm`, use its `budget=` argument for durable accounting and stop control.
+
+A missing signal record reserves default cost 1. Unknown token/time estimates reserve zero, so these
+are admission estimates, not guarantees. Actual usage may exceed estimates, including across a
+concurrent batch. Limits are checked between rounds; active tasks finish normally. Zero remaining
+in any configured dimension triggers a stop, even when a task estimates zero in that dimension.
+Unconfigured limits (`None`) are unbounded. Cost is an application-defined scalar, not necessarily
+currency. Task limits count successfully completed tasks; failed attempts do not count as completed.
+
+`AgentResult.usage` is optional and backward compatible. `ResourceUsage` records cost, input/output
+tokens, compute seconds, and custom numeric counters. Usage is written to `task.completed.payload.usage`
+and to a small namespaced field on the saved task for recovery. No separate usage event is needed.
+Missing usage remains unknown and contributes zero reported cost/tokens; it still counts as a
+completed task. Failed/interrupted agents that never return usage cannot be charged from this trace.
+Compute seconds and custom counters are retained in the trace; wall budget uses actual elapsed time
+since the run's original start, **including time offline**. Wall time is not the sum of compute times.
+
+`BudgetLedger.record(task_id, usage)` deduplicates completion records. `snapshot()`, `can_afford(signals)`,
+and `exhausted()` expose actual totals and remaining capacity. Cost arithmetic uses decimal values
+constructed from numeric strings, avoiding ordinary binary accumulation errors. Usage totals may
+exceed limits; remaining amounts clamp to zero.
+
+`Swarm.load(...)` restores saved budget limits and reconstructs usage from persisted completion
+events, filling gaps from completed task records. This covers interruption between saving a completed
+task and emitting its completion event. Replayed records do not double-count tasks. Supply `budget=`
+on load to explicitly replace limits; `BudgetLimits()` removes all limits while preserving used totals.
+Policies, agents, and custom stop-condition objects are not serialized and must be supplied again.
+
+Existing third-party `SchedulerProtocol.choose(ready_tasks, available_slots)` implementations continue
+to work. An optional `ContextualSchedulerProtocol.choose_with_context(...)` receives a
+`SchedulingContext` with run ID, budget snapshot, completed IDs, and a numeric summary. The executor
+currently supplies ready/completed task counts; external controllers can supply richer numeric
+summaries. Budget wrappers ask the underlying policy for a full ordering before filtering. Custom
+policies should return up to the requested count and must select unique members of the ready set.
+
+Stopping is composable through `StopConditionProtocol.should_stop(OrchestrationState) -> StopDecision`.
+Built-ins include `BudgetExhaustedStop`, `NoAffordableTasksStop`, `MaxTasksStop(n)`, and
+`AnyStopCondition([...])`. Pass `stop_condition=` to `Swarm`; budget conditions are added automatically
+when a budget is configured. `MaxTasksStop` also caps batch slots so concurrency does not overshoot its
+completion count. Conditions are evaluated between rounds when ready work remains.
+
+An intentional stop records `metadata["researchswarm"]["stop_reason"]`, emits `run.stop_requested`,
+and finishes the run as `COMPLETED`. This means the configured orchestration objective has stopped;
+remaining tasks retain their pending/ready state. Inspect `completed_count` and the stop reason to
+distinguish it from completing the entire DAG. Existing agent failures still produce `FAILED` and
+explicit cancellation still produces `CANCELLED`. Completed/stopped runs remain terminal, consistent
+with the existing resume contract; resume applies to interrupted nonterminal runs.
+
+Two scheduling events per round record `scheduler.round_started` and `scheduler.tasks_selected`.
+The latter contains selected IDs, candidate priorities/timestamps, the policy name, and serializable
+`TaskScore` explanations when supported. Budgeted rounds also include candidate estimates. Built-in
+information-value scores identify priority fallback explicitly. `trace_scores=True` additionally
+emits individual `scheduler.task_scored` events. Arbitrary legacy policies supply their selection
+order, not an invented explanation of their private logic. Budget snapshots emit `budget.updated`
+at startup and after each batch; a budget-triggered stop emits `budget.exhausted` and
+`run.stop_requested`. No learned policies, bandits, or automated experiment selection are included.
+
+Run [`examples/information_value_scheduler.py`](examples/information_value_scheduler.py) to see
+scores, estimated and actual costs, remaining budget, and a two-slot selection trace without API keys.
+
 ## Architecture
 
 ```text
@@ -295,10 +421,10 @@ Run any example from the repository root after installing the package.
 
 ## Non-goals and roadmap
 
-Phase 2 provides structured epistemic state, not an automated scientist. Semantic deduplication,
-automatic conflict detection, confidence updates, experiment selection, research scheduling,
-embeddings, LLM calls, provider wrappers, and SwarmBench evaluation remain outside this phase.
-Dynamic research orchestration and evaluation can build on the relationship:
+Phase 3 provides algorithmic scheduling over explicit numeric signals. Semantic deduplication,
+automatic conflict detection, confidence updates, automatic experiment design, embeddings, LLM
+supervisors, bandits, reinforcement learning, and SwarmBench evaluation remain future work.
+Those policies and evaluation tools can build on the relationship:
 
 ```text
 Research semantics -> ResearchSwarm runtime -> Structured event trace -> SwarmBench

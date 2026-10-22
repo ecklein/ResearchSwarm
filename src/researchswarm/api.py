@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from pathlib import Path
 
 from researchswarm.config import SwarmConfig
@@ -11,6 +12,10 @@ from researchswarm.graph import TaskGraph
 from researchswarm.models import AgentProtocol, Event, Run, RunStatus, SwarmResult, Task, TaskStatus
 from researchswarm.runtime.executor import SwarmExecutor
 from researchswarm.runtime.scheduler import SchedulerProtocol
+from researchswarm.scheduling.budget import BudgetLimits
+from researchswarm.scheduling.context import ContextualSchedulerProtocol
+from researchswarm.scheduling.signals import namespace
+from researchswarm.scheduling.stopping import StopConditionProtocol
 from researchswarm.storage import MemoryStorage, SQLiteStorage, StorageProtocol
 
 
@@ -24,13 +29,19 @@ class Swarm:
         storage: str | Path | StorageProtocol | None = None,
         max_concurrency: int = 4,
         fail_fast: bool = False,
-        scheduler: SchedulerProtocol | None = None,
+        scheduler: SchedulerProtocol | ContextualSchedulerProtocol | None = None,
+        budget: BudgetLimits | None = None,
+        stop_condition: StopConditionProtocol | None = None,
+        trace_scores: bool = False,
         metadata: dict[str, object] | None = None,
     ) -> None:
         self.run_record = Run(objective=objective, metadata=dict(metadata or {}))
         self.storage = _resolve_storage(storage)
         self.config = SwarmConfig(max_concurrency=max_concurrency, fail_fast=fail_fast)
         self.scheduler = scheduler
+        self.budget = budget
+        self.stop_condition = stop_condition
+        self.trace_scores = trace_scores
         self.events = EventBus()
         self.graph = TaskGraph()
         self._agents: dict[str, AgentProtocol] = {}
@@ -75,6 +86,9 @@ class Swarm:
                 events=self.events,
                 config=self.config,
                 scheduler=self.scheduler,
+                budget=self.budget,
+                stop_condition=self.stop_condition,
+                trace_scores=self.trace_scores,
             )
             return await self._executor.execute()
         finally:
@@ -109,7 +123,10 @@ class Swarm:
         storage: str | Path | StorageProtocol,
         max_concurrency: int = 4,
         fail_fast: bool = False,
-        scheduler: SchedulerProtocol | None = None,
+        scheduler: SchedulerProtocol | ContextualSchedulerProtocol | None = None,
+        budget: BudgetLimits | None = None,
+        stop_condition: StopConditionProtocol | None = None,
+        trace_scores: bool = False,
     ) -> Swarm:
         """Load an interrupted run and reset RUNNING tasks to PENDING.
 
@@ -122,12 +139,19 @@ class Swarm:
             raise ResearchSwarmError(
                 f"run {run_id} is terminal ({record.status.value}) and cannot be resumed"
             )
+        if budget is None:
+            scoped = record.metadata.get("researchswarm", {})
+            if isinstance(scoped, dict) and "budget_limits" in scoped:
+                budget = BudgetLimits(**scoped["budget_limits"])
         swarm = cls(
             record.objective,
             storage=backend,
             max_concurrency=max_concurrency,
             fail_fast=fail_fast,
             scheduler=scheduler,
+            budget=budget,
+            stop_condition=stop_condition,
+            trace_scores=trace_scores,
             metadata=record.metadata,
         )
         swarm.run_record = record
@@ -144,6 +168,10 @@ class Swarm:
         return swarm
 
     async def _initialize(self) -> None:
+        if self.budget is not None:
+            scoped = namespace(self.run_record.metadata)
+            scoped["budget_limits"] = asdict(self.budget)
+            self.run_record.metadata = {**self.run_record.metadata, "researchswarm": scoped}
         self.run_record.root_task_ids = [
             task.id for task in self.graph.tasks if not task.dependencies
         ]

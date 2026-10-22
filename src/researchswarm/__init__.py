@@ -28,6 +28,7 @@ from researchswarm.models import (
     Task,
     TaskStatus,
 )
+from researchswarm.models.usage import ResourceUsage
 from researchswarm.research import (
     Claim,
     ClaimStatus,
@@ -47,6 +48,27 @@ from researchswarm.research import (
     ResearchWorkspace,
 )
 from researchswarm.runtime import PriorityScheduler, RunContext, SchedulerProtocol, SwarmExecutor
+from researchswarm.scheduling.budget import BudgetLedger, BudgetLimits, BudgetSnapshot
+from researchswarm.scheduling.context import ContextualSchedulerProtocol, SchedulingContext
+from researchswarm.scheduling.policies import (
+    BudgetAwareScheduler,
+    InformationValueScheduler,
+    TaskScore,
+)
+from researchswarm.scheduling.signals import (
+    SchedulingSignals,
+    get_scheduling_signals,
+    set_scheduling_signals,
+)
+from researchswarm.scheduling.stopping import (
+    AnyStopCondition,
+    BudgetExhaustedStop,
+    MaxTasksStop,
+    NoAffordableTasksStop,
+    OrchestrationState,
+    StopConditionProtocol,
+    StopDecision,
+)
 from researchswarm.storage import (
     MemoryStorage,
     ResearchStorageProtocol,
@@ -55,6 +77,26 @@ from researchswarm.storage import (
 )
 
 __all__ = [
+    "ResourceUsage",
+    "BudgetLedger",
+    "BudgetLimits",
+    "BudgetSnapshot",
+    "ContextualSchedulerProtocol",
+    "SchedulingContext",
+    "BudgetAwareScheduler",
+    "InformationValueScheduler",
+    "TaskScore",
+    "SchedulingSignals",
+    "get_scheduling_signals",
+    "set_scheduling_signals",
+    "AnyStopCondition",
+    "BudgetExhaustedStop",
+    "MaxTasksStop",
+    "NoAffordableTasksStop",
+    "OrchestrationState",
+    "StopConditionProtocol",
+    "StopDecision",
+
     "Hypothesis",
     "HypothesisStatus",
     "Claim",

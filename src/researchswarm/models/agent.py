@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from researchswarm.models.artifact import Artifact
 from researchswarm.models.task import Task
+from researchswarm.models.usage import ResourceUsage
 
 if TYPE_CHECKING:
     from researchswarm.runtime.context import RunContext
@@ -20,6 +21,7 @@ class AgentResult:
     artifacts: list[Artifact] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
     new_tasks: list[Task] = field(default_factory=list)
+    usage: ResourceUsage | None = None
 
 
 @runtime_checkable

@@ -10,6 +10,7 @@ from typing import Any, TypeVar, cast
 
 from researchswarm.exceptions import SerializationError
 from researchswarm.models import AgentResult, Artifact, Event, Run, RunStatus, Task, TaskStatus
+from researchswarm.models.usage import ResourceUsage
 
 T = TypeVar("T")
 
@@ -85,4 +86,5 @@ def agent_result_from_dict(data: dict[str, Any]) -> AgentResult:
         artifacts=[artifact_from_dict(item) for item in data.get("artifacts", [])],
         metadata=data.get("metadata", {}),
         new_tasks=[task_from_dict(item) for item in data.get("new_tasks", [])],
+        usage=ResourceUsage(**data["usage"]) if data.get("usage") is not None else None,
     )
